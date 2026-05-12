@@ -3,15 +3,18 @@ from __future__ import annotations
 import html
 import json
 import logging
+import re
 import time
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from typing import Any
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import httpx
 
@@ -59,12 +62,55 @@ _DIGEST_DENIED = (
     "Узнать свой id: напишите боту @userinfobot или @getidsbot в личку."
 )
 
+_AUTOSTART_HELP = (
+    "Автодайджест (как /digest без аргументов — за календарный вчера по DIGEST_TZ):\n\n"
+    "/autostart ЧЧ:ММ — каждый день в это время публиковать сводку в этот чат. "
+    "Если команда из темы форума — публикация пойдёт в эту тему.\n"
+    "Примеры: /autostart 9:00  /autostart 09:30  /autostart 21:15\n\n"
+    "/autostart_info — показать текущее расписание для этой группы.\n"
+    "/autostart_stop — отключить автозапуск в этой группе."
+)
+
+
+def _parse_autostart_hh_mm(raw: str) -> tuple[int, int] | None:
+    s = raw.strip().replace(" ", "")
+    if not s:
+        return None
+    if ":" in s:
+        a, b = s.split(":", 1)
+    else:
+        a, b = s, "0"
+    if not re.fullmatch(r"\d{1,2}", a) or not re.fullmatch(r"\d{1,2}", b):
+        return None
+    h, m = int(a), int(b)
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return h, m
+
 
 async def _answer_llm_html_chunks(message: Message, text: str) -> None:
     """Ответ LLM в Telegram: **жирный**, *курсив* → HTML, parse_mode=HTML."""
+    await _send_llm_html_chunks(
+        message.bot,
+        message.chat.id,
+        message.message_thread_id,
+        text,
+    )
+
+
+async def _send_llm_html_chunks(
+    bot: Bot,
+    chat_id: int,
+    message_thread_id: int | None,
+    text: str,
+) -> None:
+    """Те же HTML-чанки, что и у ответа на команду, но в произвольный чат / тему форума."""
     html_text = llm_double_stars_to_telegram_html(text)
+    kwargs: dict[str, Any] = {}
+    if message_thread_id is not None:
+        kwargs["message_thread_id"] = message_thread_id
     for chunk in split_telegram_chunks(html_text):
-        await message.answer(chunk, parse_mode=ParseMode.HTML)
+        await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML, **kwargs)
 
 
 def _parse_digest_args_tail(tail: str | None) -> tuple[date | None, bool, str | None]:
@@ -306,23 +352,21 @@ async def _send_filtered_raw_export_for_local_day(
     )
 
 
-async def _run_digest_for_day(
-    message: Message,
+async def _run_digest_for_day_core(
     *,
+    bot: Bot,
+    chat_id: int,
+    message_thread_id: int | None,
+    status_msg: Message,
     target: date,
     force: bool,
     db: Database,
     settings: Settings,
     llm: ZaiDigestLLM,
 ) -> None:
-    chat_id = message.chat.id
     tz_name = settings.digest_tz
     local_date_str = target.isoformat()
     start_utc, end_utc = local_day_bounds_utc(target, tz_name)
-
-    status_msg = await message.reply(
-        f"Собираю сообщения за {local_date_str} ({tz_name})…",
-    )
 
     limit = settings.digest_max_messages if settings.digest_max_messages > 0 else None
     total = await db.count_messages_for_day(chat_id=chat_id, start_utc=start_utc, end_utc=end_utc)
@@ -359,7 +403,7 @@ async def _run_digest_for_day(
         if truncated:
             body = f"[Обрезано: в дайджест вошли последние {limit} из {total} сообщений]\n\n{body}"
         await status_msg.delete()
-        await _answer_llm_html_chunks(message, body)
+        await _send_llm_html_chunks(bot, chat_id, message_thread_id, body)
         return
 
     await status_msg.edit_text("Зову модель…")
@@ -399,7 +443,89 @@ async def _run_digest_for_day(
     if truncated:
         body = f"[Обрезано: в дайджест вошли последние {limit} из {total} сообщений]\n\n{body}"
     await status_msg.delete()
-    await _answer_llm_html_chunks(message, body)
+    await _send_llm_html_chunks(bot, chat_id, message_thread_id, body)
+
+
+async def _run_digest_for_day(
+    message: Message,
+    *,
+    target: date,
+    force: bool,
+    db: Database,
+    settings: Settings,
+    llm: ZaiDigestLLM,
+) -> None:
+    chat_id = message.chat.id
+    thread_id = message.message_thread_id
+    tz_name = settings.digest_tz
+    local_date_str = target.isoformat()
+
+    status_msg = await message.reply(
+        f"Собираю сообщения за {local_date_str} ({tz_name})…",
+    )
+    await _run_digest_for_day_core(
+        bot=message.bot,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        status_msg=status_msg,
+        target=target,
+        force=force,
+        db=db,
+        settings=settings,
+        llm=llm,
+    )
+
+
+async def execute_scheduled_daily_digest(
+    bot: Bot,
+    db: Database,
+    settings: Settings,
+    llm: ZaiDigestLLM,
+    *,
+    chat_id: int,
+    message_thread_id: int | None,
+) -> None:
+    """
+    То же содержание, что у /digest без аргументов: «вчера» по DIGEST_TZ, force=False.
+    """
+    thread_id = message_thread_id
+    target = yesterday(settings.digest_tz)
+    tz_name = settings.digest_tz
+    local_date_str = target.isoformat()
+    send_kw: dict[str, Any] = {}
+    if thread_id is not None:
+        send_kw["message_thread_id"] = thread_id
+    try:
+        status_msg = await bot.send_message(
+            chat_id,
+            f"Собираю сообщения за {local_date_str} ({tz_name})…",
+            **send_kw,
+        )
+    except Exception:
+        logger.exception(
+            "scheduled digest: не удалось отправить статус в chat=%s thread=%s",
+            chat_id,
+            thread_id,
+        )
+        return
+    try:
+        await _run_digest_for_day_core(
+            bot=bot,
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            status_msg=status_msg,
+            target=target,
+            force=False,
+            db=db,
+            settings=settings,
+            llm=llm,
+        )
+    except Exception:
+        logger.exception("scheduled digest failed chat=%s", chat_id)
+        try:
+            await status_msg.edit_text("Ошибка при авто-дайджесте. Смотрите лог бота.")
+        except Exception:
+            pass
 
 
 @router.message(
@@ -751,3 +877,126 @@ async def cmd_poe2leagues(message: Message, settings: Settings) -> None:
     catalog = build_leagues_catalog_text(rows)
     for chunk in split_telegram_chunks(catalog):
         await message.reply(chunk)
+
+
+@router.message(
+    Command("autostart", ignore_mention=True),
+    lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP},
+)
+async def cmd_autostart(
+    message: Message,
+    command: CommandObject,
+    db: Database,
+    settings: Settings,
+    llm: ZaiDigestLLM,
+    scheduler: AsyncIOScheduler | None,
+) -> None:
+    if not _user_can_digest(message, settings):
+        await message.reply(_DIGEST_DENIED)
+        return
+    if scheduler is None:
+        await message.reply(
+            "Планировщик недоступен: проверьте корректность DIGEST_TZ в .env бота.",
+        )
+        return
+    tail = (command.args or "").strip()
+    if not tail:
+        await message.reply(_AUTOSTART_HELP)
+        return
+    hm = _parse_autostart_hh_mm(tail)
+    if hm is None:
+        await message.reply(
+            "Не понял время. Пример: /autostart 9:00 или /autostart 09:30 (формат ЧЧ:ММ, часовой пояс — DIGEST_TZ).",
+        )
+        return
+    hour, minute = hm
+    thread_id = message.message_thread_id
+    from tg_digest_bot.autostart import refresh_digest_autostart_jobs
+
+    await db.upsert_digest_autostart(
+        chat_id=message.chat.id,
+        message_thread_id=thread_id,
+        hour=hour,
+        minute=minute,
+        updated_at=int(time.time()),
+    )
+    await refresh_digest_autostart_jobs(scheduler, message.bot, db, settings, llm)
+    tid_txt = f"тема message_thread_id={thread_id}" if thread_id is not None else "общий чат (без темы)"
+    await message.reply(
+        f"Ок: каждый день в {hour:02d}:{minute:02d} ({settings.digest_tz}) "
+        f"бот опубликует дайджест за вчера в этот чат ({tid_txt}).\n"
+        "/autostart_info — напомнить настройки, /autostart_stop — отключить.",
+    )
+
+
+@router.message(
+    Command("autostart_info", ignore_mention=True),
+    lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP},
+)
+async def cmd_autostart_info(
+    message: Message,
+    db: Database,
+    settings: Settings,
+    scheduler: AsyncIOScheduler | None,
+) -> None:
+    if not _user_can_digest(message, settings):
+        await message.reply(_DIGEST_DENIED)
+        return
+    row = await db.get_digest_autostart(chat_id=message.chat.id)
+    if row is None:
+        await message.reply(
+            "Автодайджест для этой группы не настроен. См. /autostart",
+        )
+        return
+    tid = row["message_thread_id"]
+    tid_line = (
+        f"Тема форума: message_thread_id={int(tid)}"
+        if tid is not None
+        else "Публикация: общий чат (тема не задана; команда настраивалась не из темы)"
+    )
+    try:
+        tz = ZoneInfo(settings.digest_tz)
+        ts = int(row["updated_at"])
+        updated = datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        updated = str(row["updated_at"])
+    sched_ok = "да" if scheduler is not None else "нет (ошибка DIGEST_TZ — задания не выполняются)"
+    await message.reply(
+        f"Автодайджест: каждый день в {int(row['hour']):02d}:{int(row['minute']):02d} "
+        f"по {settings.digest_tz}.\n"
+        f"{tid_line}.\n"
+        f"Последнее изменение: {updated}.\n"
+        f"Планировщик активен: {sched_ok}.",
+    )
+
+
+@router.message(
+    Command("autostart_stop", ignore_mention=True),
+    lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP},
+)
+async def cmd_autostart_stop(
+    message: Message,
+    db: Database,
+    settings: Settings,
+    llm: ZaiDigestLLM,
+    scheduler: AsyncIOScheduler | None,
+) -> None:
+    if not _user_can_digest(message, settings):
+        await message.reply(_DIGEST_DENIED)
+        return
+    had = await db.get_digest_autostart(chat_id=message.chat.id)
+    await db.delete_digest_autostart(chat_id=message.chat.id)
+    if scheduler is not None:
+        from tg_digest_bot.autostart import refresh_digest_autostart_jobs
+
+        await refresh_digest_autostart_jobs(scheduler, message.bot, db, settings, llm)
+    if had is None:
+        text = "Автодайджест уже был выключен (настроек не было)."
+    else:
+        text = "Автодайджест для этой группы отключён."
+    if scheduler is None and had is not None:
+        text += (
+            "\n\nВнимание: планировщик не запущен (ошибка DIGEST_TZ). "
+            "После исправления .env перезапустите бота."
+        )
+    await message.reply(text)

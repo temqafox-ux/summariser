@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS digests (
 
 CREATE INDEX IF NOT EXISTS idx_digests_lookup
     ON digests (chat_id, local_date, tz, prompt_version, max_message_id);
+
+CREATE TABLE IF NOT EXISTS digest_autostart (
+    chat_id INTEGER NOT NULL PRIMARY KEY,
+    message_thread_id INTEGER,
+    hour INTEGER NOT NULL,
+    minute INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -107,6 +115,55 @@ class Database:
                 ),
             )
             await self.conn.commit()
+
+    async def upsert_digest_autostart(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int | None,
+        hour: int,
+        minute: int,
+        updated_at: int,
+    ) -> None:
+        async with self._lock:
+            await self.conn.execute(
+                """
+                INSERT INTO digest_autostart (chat_id, message_thread_id, hour, minute, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    message_thread_id = excluded.message_thread_id,
+                    hour = excluded.hour,
+                    minute = excluded.minute,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, message_thread_id, hour, minute, updated_at),
+            )
+            await self.conn.commit()
+
+    async def delete_digest_autostart(self, *, chat_id: int) -> None:
+        async with self._lock:
+            await self.conn.execute(
+                "DELETE FROM digest_autostart WHERE chat_id = ?",
+                (chat_id,),
+            )
+            await self.conn.commit()
+
+    async def get_digest_autostart(self, *, chat_id: int) -> dict[str, Any] | None:
+        async with self._lock:
+            cur = await self.conn.execute(
+                "SELECT chat_id, message_thread_id, hour, minute, updated_at FROM digest_autostart WHERE chat_id = ?",
+                (chat_id,),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_digest_autostarts(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            cur = await self.conn.execute(
+                "SELECT chat_id, message_thread_id, hour, minute, updated_at FROM digest_autostart ORDER BY chat_id"
+            )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def fetch_messages_for_day(
         self,
