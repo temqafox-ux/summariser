@@ -25,6 +25,75 @@ pip install -e .
 python -m tg_digest_bot
 ```
 
+## Деплой на VPS (Git + systemd)
+
+Предполагается **Debian/Ubuntu**, исходники уже в репозитории на GitHub/GitLab — на сервере делаешь `git clone` / `git pull`.
+
+1. **Python 3.11+**  
+   Например Ubuntu 24.04: `sudo apt update && sudo apt install -y git python3 python3-venv`
+
+2. **Пользователь под бота** (не под root), домашний каталог не обязан совпадать с кодом:
+   ```bash
+   sudo useradd --system --shell /usr/sbin/nologin tgbot
+   sudo git clone <URL_твоего_репо> /opt/tg-digest-bot
+   sudo chown -R tgbot:tgbot /opt/tg-digest-bot
+   ```
+   Либо работай под своим пользователем и в unit-файле укажи своего `User`/`Group`.
+
+3. **Код и venv**:
+   ```bash
+   cd /opt/tg-digest-bot
+   sudo -u tgbot bash deploy/bootstrap-vps.sh
+   ```
+   Скрипт создаёт `.venv`, ставит зависимости `pip install -e .`.
+
+4. **`.env`** в `/opt/tg-digest-bot/.env`, права `chmod 600`. Обязательно задай абсолютный путь к БД, например:
+   `DATABASE_PATH=/opt/tg-digest-bot/data/bot.sqlite3`  
+   Плюс `BOT_TOKEN`, `Z_AI_API_KEY`, `DIGEST_ALLOWED_USER_IDS`, `DIGEST_TZ`, осмысленный `HTTP_USER_AGENT` (часто просят контакт в UA для внешних API).
+
+5. **systemd**: скопируй [deploy/tg-digest-bot.service.example](deploy/tg-digest-bot.service.example) в `/etc/systemd/system/tg-digest-bot.service`, поправь `User`, `Group`, `WorkingDirectory`, `ExecStart` (путь к `python` внутри `.venv`), затем:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now tg-digest-bot
+   journalctl -u tg-digest-bot -f
+   ```
+
+6. **Обновление после `git pull`**:
+   ```bash
+   sudo systemctl stop tg-digest-bot
+   cd /opt/tg-digest-bot && sudo -u tgbot git pull
+   sudo -u tgbot bash -c 'cd /opt/tg-digest-bot && . .venv/bin/activate && pip install -e .'
+   sudo systemctl start tg-digest-bot
+   ```
+
+Исходящие HTTPS (Telegram polling, Z.AI, опционально фид лиг) **не требуют** открывать входящий порт на файрволе.
+
+## Деплой в Docker (VPS или локально)
+
+Образ поднимает бота в фоне с **`restart: unless-stopped`**, SQLite лежит на хосте в каталоге **`./data`** (том в `docker-compose.yml`).
+
+1. На сервере: `git clone` / `git pull`, в корне репозитория скопируй [.env.example](.env.example) → `.env`, заполни секреты и настройки. Строку `DATABASE_PATH` в `.env` для Compose **можно не трогать**: в [docker-compose.yml](docker-compose.yml) задано переопределение `DATABASE_PATH=/data/bot.sqlite3` внутри контейнера.
+
+2. Каталог под БД с правами пользователя в образе (**uid 1000**):
+   ```bash
+   mkdir -p data
+   sudo chown 1000:1000 data
+   ```
+
+3. Запуск в фоне и логи:
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f
+   ```
+
+4. Обновление после коммита:
+   ```bash
+   git pull
+   docker compose up -d --build
+   ```
+
+Нужны установленные [Docker Engine](https://docs.docker.com/engine/install/) и плагин Compose v2 (`docker compose`). Входящие порты по-прежнему не нужны.
+
 ## Команды (в группе)
 
 - `/digest` — вчера по календарю в `DIGEST_TZ`.

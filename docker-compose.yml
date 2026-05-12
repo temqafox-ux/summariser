@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    image: tg-digest-bot:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Персистентный том ./data на хосте; не полагайся на относительный путь внутри контейнера
+      DATABASE_PATH: /data/bot.sqlite3
+    volumes:
+      - ./data:/data

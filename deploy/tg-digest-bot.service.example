@@ -1,0 +1,28 @@
+# Пример unit для systemd (Debian/Ubuntu).
+# 1) Скопируйте и поправьте пути и User/Group под свой сервер:
+#    sudo cp deploy/tg-digest-bot.service.example /etc/systemd/system/tg-digest-bot.service
+# 2) sudo systemctl daemon-reload
+# 3) sudo systemctl enable --now tg-digest-bot
+#
+# В каталоге WorkingDirectory должен лежать .env (см. .env.example).
+# Либо уберите эту строку и задайте переменные через drop-in или EnvironmentFile.
+
+[Unit]
+Description=Telegram digest bot (tg_digest_bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/tg-digest-bot
+ExecStart=/opt/tg-digest-bot/.venv/bin/python -m tg_digest_bot
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-digest-bot
+
+[Install]
+WantedBy=multi-user.target
