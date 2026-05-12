@@ -35,6 +35,7 @@ from tg_digest_bot.poe2scout_client import (
     snapshot_for_llm,
 )
 from tg_digest_bot.telegram_chunks import split_telegram_chunks
+from tg_digest_bot.telegram_llm_html import llm_double_stars_to_telegram_html
 from tg_digest_bot.timeutil import local_day_bounds_utc, parse_iso_date, today, yesterday
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,13 @@ _DIGEST_DENIED = (
     "Это не «ник» в настройках профиля и не обязательно @username.\n"
     "Узнать свой id: напишите боту @userinfobot или @getidsbot в личку."
 )
+
+
+async def _answer_llm_html_chunks(message: Message, text: str) -> None:
+    """Ответ LLM в Telegram: **жирный** → HTML, parse_mode=HTML."""
+    html_text = llm_double_stars_to_telegram_html(text)
+    for chunk in split_telegram_chunks(html_text):
+        await message.answer(chunk, parse_mode=ParseMode.HTML)
 
 
 def _parse_digest_args_tail(tail: str | None) -> tuple[date | None, bool, str | None]:
@@ -351,8 +359,7 @@ async def _run_digest_for_day(
         if truncated:
             body = f"[Обрезано: в дайджест вошли последние {limit} из {total} сообщений]\n\n{body}"
         await status_msg.delete()
-        for chunk in split_telegram_chunks(body):
-            await message.answer(chunk)
+        await _answer_llm_html_chunks(message, body)
         return
 
     await status_msg.edit_text("Зову модель…")
@@ -392,8 +399,7 @@ async def _run_digest_for_day(
     if truncated:
         body = f"[Обрезано: в дайджест вошли последние {limit} из {total} сообщений]\n\n{body}"
     await status_msg.delete()
-    for chunk in split_telegram_chunks(body):
-        await message.answer(chunk)
+    await _answer_llm_html_chunks(message, body)
 
 
 @router.message(
@@ -603,8 +609,7 @@ async def cmd_poe2build(
         header = f"PoE2-билд по душе за {local_date_str} (по твоим сообщениям в чате):\n\n"
     else:
         header = f"PoE2-билд по душе за {local_date_str} (по сообщениям @{nick_query} в чате):\n\n"
-    for chunk in split_telegram_chunks(header + text):
-        await message.answer(chunk)
+    await _answer_llm_html_chunks(message, header + text)
 
 
 @router.message(
@@ -717,8 +722,7 @@ async def cmd_poe2market(
     except Exception:
         logger.debug("could not delete status message", exc_info=True)
     header = "Мемная сводка по рынку лиги PoE2:\n\n"
-    for chunk in split_telegram_chunks(header + text):
-        await message.answer(chunk)
+    await _answer_llm_html_chunks(message, header + text)
 
 
 @router.message(
