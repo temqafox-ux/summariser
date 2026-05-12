@@ -6,6 +6,8 @@ import logging
 import time
 from datetime import date
 
+from typing import Any
+
 from aiogram import Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandObject
@@ -81,6 +83,73 @@ def _parse_digest_args_tail(tail: str | None) -> tuple[date | None, bool, str | 
         return None, force, "Неверная дата. Формат: YYYY-MM-DD"
 
 
+def _poe2build_token_is_iso_date(token: str) -> bool:
+    if len(token) != 10 or token[4] != "-" or token[7] != "-":
+        return False
+    try:
+        parse_iso_date(token)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_poe2build_args(tail: str | None, tz: str) -> tuple[date | None, str | None, str | None]:
+    """
+    Возвращает (день, username без @ или None = вызывающий, ошибка).
+    Допустимо: пусто | YYYY-MM-DD | @ник | ник | @ник YYYY-MM-DD | YYYY-MM-DD @ник
+    """
+    raw = (tail or "").strip()
+    if not raw:
+        return today(tz), None, None
+    parts = [p.strip() for p in raw.split() if p.strip()]
+    if len(parts) > 2:
+        return (
+            None,
+            None,
+            "Слишком много аргументов. Примеры: /poe2build | /poe2build 2026-05-12 | /poe2build @tmqfx | "
+            "/poe2build @tmqfx 2026-05-12 | /poe2build 2026-05-12 @tmqfx",
+        )
+    day: date | None = None
+    nick: str | None = None
+    for p in parts:
+        if _poe2build_token_is_iso_date(p):
+            if day is not None:
+                return None, None, "Дата указана дважды."
+            day = parse_iso_date(p)
+        else:
+            n = p.lstrip("@").strip()
+            if not n:
+                return None, None, "Пустой ник."
+            if nick is not None:
+                return None, None, "Укажи не больше одного ника."
+            nick = n
+    if len(parts) == 2 and (day is None or nick is None):
+        return None, None, "Нужны и дата YYYY-MM-DD, и ник (любой порядок)."
+    if day is None:
+        day = today(tz)
+    return day, nick, None
+
+
+def _transcript_user_day_for_build(
+    rows: list[dict[str, Any]],
+    *,
+    max_line_chars: int,
+    transcript_max_chars: int,
+) -> str:
+    lines: list[str] = []
+    for r in rows:
+        t = (r.get("text") or "").replace("\n", " ").strip()
+        if not t:
+            continue
+        if len(t) > max_line_chars:
+            t = t[: max_line_chars - 1] + "…"
+        lines.append(f"[{r['message_id']}] {t}")
+    body = "\n".join(lines)
+    if len(body) <= transcript_max_chars:
+        return body
+    return body[: transcript_max_chars - 80] + "\n\n[…дальше сообщения обрезаны по лимиту длины для модели.]"
+
+
 def _parse_digest_mini_args(tail: str | None, tz: str) -> tuple[date | None, str | None]:
     """Пусто -> вчера; одна дата YYYY-MM-DD; «сегодня» / «today»."""
     raw = (tail or "").strip()
@@ -96,6 +165,11 @@ def _parse_digest_mini_args(tail: str | None, tz: str) -> tuple[date | None, str
         return parse_iso_date(parts[0]), None
     except ValueError:
         return None, "Неверная дата. Формат: YYYY-MM-DD (как в /digest)."
+
+
+# Макс. число реплик и длина тела для одного вызова LLM по билду
+_POE2_BUILD_MAX_MESSAGES = 450
+_POE2_BUILD_TRANSCRIPT_CAP = 28_000
 
 
 # Telegram message hard limit; запас под HTML <pre></pre>
@@ -418,6 +492,119 @@ async def cmd_digest_mini(
     except Exception:
         logger.exception("digest_mini failed chat=%s", message.chat.id)
         await message.reply("Ошибка при выполнении /digest_mini. Смотрите лог в консоли бота.")
+
+
+@router.message(
+    Command("poe2build", ignore_mention=True),
+    lambda m: m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP},
+)
+async def cmd_poe2build(
+    message: Message,
+    command: CommandObject,
+    db: Database,
+    settings: Settings,
+    llm: ZaiDigestLLM,
+) -> None:
+    if not _user_can_digest(message, settings):
+        await message.reply(_DIGEST_DENIED)
+        return
+    user = message.from_user
+    if user is None:
+        return
+    target, nick_query, err = _parse_poe2build_args(command.args, settings.digest_tz)
+    if err:
+        await message.reply(err)
+        return
+    local_date_str = target.isoformat()
+    logger.info(
+        "/poe2build caller=%s chat_id=%s day=%s nick=%r",
+        user.id,
+        message.chat.id,
+        local_date_str,
+        nick_query,
+    )
+    chat_id = message.chat.id
+    start_utc, end_utc = local_day_bounds_utc(target, settings.digest_tz)
+
+    if nick_query is None:
+        target_uid = user.id
+        status_msg = await message.reply("Сканирую твои реплики и мэтчу с билдом PoE2…")
+    else:
+        status_msg = await message.reply(f"Сканирую реплики @{nick_query} и мэтчу с билдом PoE2…")
+        try:
+            resolved = await db.resolve_user_id_by_username_in_day(
+                chat_id=chat_id,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                username=nick_query,
+            )
+        except Exception:
+            logger.exception("poe2build resolve username failed chat=%s", message.chat.id)
+            await status_msg.edit_text("Не вышло искать пользователя в базе. Смотри лог бота.")
+            return
+        if resolved is None:
+            await status_msg.edit_text(
+                f"За {local_date_str} в этой группе нет сохранённых сообщений с @username «{nick_query}» "
+                "(бот видит только текст с ником из Telegram; если человек писал без @username в профиле — не найдётся).",
+            )
+            return
+        target_uid = resolved
+
+    try:
+        rows = await db.fetch_messages_for_user_day(
+            chat_id=chat_id,
+            user_id=target_uid,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            limit=_POE2_BUILD_MAX_MESSAGES,
+        )
+    except Exception:
+        logger.exception("poe2build DB failed chat=%s", message.chat.id)
+        await status_msg.edit_text("Не вышло прочитать сообщения из базы. Смотри лог бота.")
+        return
+    if not rows:
+        who = "твоих" if nick_query is None else f"@{nick_query}"
+        await status_msg.edit_text(
+            f"За {local_date_str} ({settings.digest_tz}) нет сохранённых сообщений {who} в этой группе.",
+        )
+        return
+    tr = _transcript_user_day_for_build(
+        rows,
+        max_line_chars=settings.digest_filter_max_message_chars,
+        transcript_max_chars=_POE2_BUILD_TRANSCRIPT_CAP,
+    )
+    if not tr.strip():
+        await status_msg.edit_text("За этот день только пустые сообщения — нечего анализировать.")
+        return
+    last_un = (rows[-1].get("username") or "").strip()
+    if last_un:
+        label = f"@{last_un}"
+    elif nick_query:
+        label = f"@{nick_query}"
+    else:
+        label = f"user:{target_uid}"
+    try:
+        text = await llm.poe2_build_fit(
+            transcript=tr,
+            user_label=label,
+            local_date=local_date_str,
+            tz_name=settings.digest_tz,
+        )
+    except Exception as e:
+        detail = format_openai_api_error(e)
+        logger.exception("poe2build LLM failed: %s", detail)
+        await status_msg.edit_text(f"Не вышло вызвать модель.\n{detail}")
+        return
+    try:
+        await status_msg.delete()
+    except Exception:
+        logger.debug("could not delete poe2build status", exc_info=True)
+    if nick_query is None:
+        header = f"PoE2-билд по душе за {local_date_str} (по твоим сообщениям в чате):\n\n"
+    else:
+        header = f"PoE2-билд по душе за {local_date_str} (по сообщениям @{nick_query} в чате):\n\n"
+    for chunk in split_telegram_chunks(header + text):
+        await message.answer(chunk)
 
 
 @router.message(

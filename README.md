@@ -99,7 +99,28 @@ docker compose restart
 ```
 Если файл БД уже есть и не помогает — проверь `ls -la data/` (у каталога и у `*.sqlite3*` должны быть права на запись для владельца 1000). SQLite также пишет в каталог рядом с файлом (WAL), поэтому важны права **на всю папку `data`**, не только на файл.
 
-Нужны установленные [Docker Engine](https://docs.docker.com/engine/install/) и плагин Compose v2 (`docker compose`). Входящие порты по-прежнему не нужны.
+Нужен **Docker Engine** с поддержкой **`docker compose`** (Compose v2). Входящие порты не нужны.
+
+**Если `apt install docker-compose-plugin` пишет `Unable to locate package`, а `docker compose` — `unknown command`:** чаще всего стоит пакет **`docker.io`** из репозитория дистрибутива без плагина. Варианты:
+
+1. **Правильно (рекомендуется)** — поставить официальный Docker Engine по инструкции для твоей ОС, там же появится плагин:  
+   [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/) (для Debian — соседняя страница в меню). После этого:
+   ```bash
+   sudo apt install -y docker-compose-plugin
+   docker compose version
+   ```
+
+2. **Быстро, только плагин Compose v2** (если `docker` уже рабочий, но нет `compose`) — бинарник в каталог плагинов CLI:
+   ```bash
+   sudo mkdir -p /usr/local/lib/docker/cli-plugins
+   sudo curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
+     -o /usr/local/lib/docker/cli-plugins/docker-compose
+   sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+   docker compose version
+   ```
+   Если `uname -m` не совпадёт с именем файла в релизе (редко), скачай вручную с [страницы релизов compose](https://github.com/docker/compose/releases).
+
+**Не используй устаревший `docker-compose` 1.x** (Python, `docker-compose==1.29.2`): на новом Docker Engine часто падает с `KeyError: 'ContainerConfig'`. Вызывай только **`docker compose`** (с пробелом).
 
 ## Команды (в группе)
 
@@ -113,6 +134,7 @@ docker compose restart
 - `/digest_today_raw_filtered` — JSON **того же представления**, что уходит в LLM: пользователи и списки обрезанных строк, плюс поле `filter` с параметрами.
 - `/poe2market` — мемная «новостная» сводка по рынку лиги: сначала запрос **публичного** REST без ключа (агрегатор листингов, настраивается `POE2_SCOUT_*`), затем LLM; в тексте ответа **не** должны светиться названия сторонних сервисов. Статус «Собираю рынок…» перед выдачей. Опционально: `/poe2market Standard` — имя лиги как в фиде (регистр не важен). Без аргумента — `POE2_MARKET_LEAGUE` из `.env` или авто «текущая» софткор.
 - `/poe2leagues` — список имён лиг из того же фида (удобно подставить в `/poe2market`).
+- `/poe2build` — мемный «вердикт GGG»: по **твоим** сообщениям в этой группе за **сегодня** (`DIGEST_TZ`) LLM подбирает стиль билда Path of Exile 2; скиллы/гемы можно на английском. **`/poe2build @username`** или **`/poe2build username`** — за **сегодня** по сообщениям этого человека (ищем в БД по полю `@username` в сохранённых сообщениях). **`/poe2build @nick 2026-05-12`** или **`/poe2build 2026-05-12 @nick`** — за указанную дату. Без аргумента = сегодня, ты сам; до 450 реплик; длина строк — `DIGEST_FILTER_MAX_MESSAGE_CHARS`.
 
 **Кто может вызывать:** только пользователи из **`DIGEST_ALLOWED_USER_IDS`** в `.env` — это **числа** (Telegram user id), через запятую. Это **не** «ник» в профиле и **не обязательно** строка `@username` (username может не быть или смениться). Свой id можно посмотреть через ботов вроде [@userinfobot](https://t.me/userinfobot) или [@getidsbot](https://t.me/getidsbot). Старое имя переменной **`ADMIN_USER_IDS`** всё ещё читается, если `DIGEST_ALLOWED_USER_IDS` пустой.
 

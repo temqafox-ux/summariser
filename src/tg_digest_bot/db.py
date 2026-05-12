@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_date
     ON messages (chat_id, date_utc);
 
+CREATE INDEX IF NOT EXISTS idx_messages_chat_user_date
+    ON messages (chat_id, user_id, date_utc);
+
 CREATE TABLE IF NOT EXISTS digests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -142,6 +145,77 @@ class Database:
             cur = await self.conn.execute(sql, params)
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def fetch_messages_for_user_day(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        start_utc: int,
+        end_utc: int,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        """
+        Сообщения одного пользователя за локальный день, по возрастанию message_id.
+        Если limit задан — берутся самые новые limit строк (остальное отбрасывается).
+        """
+        params: list[Any] = [chat_id, user_id, start_utc, end_utc]
+        if limit is not None and limit > 0:
+            sql = """
+                SELECT chat_id, message_id, user_id, username, date_utc, text, reply_to_message_id
+                FROM (
+                    SELECT chat_id, message_id, user_id, username, date_utc, text, reply_to_message_id
+                    FROM messages
+                    WHERE chat_id = ? AND user_id = ? AND date_utc >= ? AND date_utc < ?
+                    ORDER BY message_id DESC
+                    LIMIT ?
+                ) sub
+                ORDER BY message_id ASC
+                """
+            params.append(limit)
+        else:
+            sql = """
+                SELECT chat_id, message_id, user_id, username, date_utc, text, reply_to_message_id
+                FROM messages
+                WHERE chat_id = ? AND user_id = ? AND date_utc >= ? AND date_utc < ?
+                ORDER BY message_id ASC
+                """
+        async with self._lock:
+            cur = await self.conn.execute(sql, params)
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def resolve_user_id_by_username_in_day(
+        self,
+        *,
+        chat_id: int,
+        start_utc: int,
+        end_utc: int,
+        username: str,
+    ) -> int | None:
+        """
+        user_id с наибольшим числом сообщений за день среди строк с тем же @username (без учёта регистра).
+        """
+        u = username.strip().lstrip("@").strip()
+        if not u:
+            return None
+        async with self._lock:
+            cur = await self.conn.execute(
+                """
+                SELECT user_id, COUNT(*) AS cnt
+                FROM messages
+                WHERE chat_id = ?
+                  AND date_utc >= ? AND date_utc < ?
+                  AND username IS NOT NULL AND LENGTH(TRIM(username)) > 0
+                  AND LOWER(username) = LOWER(?)
+                GROUP BY user_id
+                ORDER BY cnt DESC, user_id ASC
+                LIMIT 1
+                """,
+                (chat_id, start_utc, end_utc, u),
+            )
+            row = await cur.fetchone()
+        return int(row["user_id"]) if row else None
 
     async def count_messages_for_day(
         self,
