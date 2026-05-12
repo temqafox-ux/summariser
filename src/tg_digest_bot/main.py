@@ -39,8 +39,9 @@ async def _async_main() -> None:
     )
     dp = Dispatcher()
     dp.update.outer_middleware(InjectMiddleware(db=db, settings=settings, llm=llm))
-    dp.include_router(messages_router)
+    # Digest first so commands are not lost if handler ordering ever changes
     dp.include_router(digest_router)
+    dp.include_router(messages_router)
 
     try:
         await dp.start_polling(bot)
