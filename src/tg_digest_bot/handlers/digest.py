@@ -61,7 +61,7 @@ _DIGEST_DENIED = (
 
 
 async def _answer_llm_html_chunks(message: Message, text: str) -> None:
-    """Ответ LLM в Telegram: **жирный** → HTML, parse_mode=HTML."""
+    """Ответ LLM в Telegram: **жирный**, *курсив* → HTML, parse_mode=HTML."""
     html_text = llm_double_stars_to_telegram_html(text)
     for chunk in split_telegram_chunks(html_text):
         await message.answer(chunk, parse_mode=ParseMode.HTML)
