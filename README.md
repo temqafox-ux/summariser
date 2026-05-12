@@ -92,6 +92,13 @@ python -m tg_digest_bot
    docker compose up -d --build
    ```
 
+**Если в логах `attempt to write a readonly database`:** процесс в контейнере идёт от **uid 1000**, а каталог `data` или файл `bot.sqlite3` на хосте созданы от **root** (часто после первого запуска без `chown`). Исправление на сервере из каталога с репозиторием:
+```bash
+sudo chown -R 1000:1000 data
+docker compose restart
+```
+Если файл БД уже есть и не помогает — проверь `ls -la data/` (у каталога и у `*.sqlite3*` должны быть права на запись для владельца 1000). SQLite также пишет в каталог рядом с файлом (WAL), поэтому важны права **на всю папку `data`**, не только на файл.
+
 Нужны установленные [Docker Engine](https://docs.docker.com/engine/install/) и плагин Compose v2 (`docker compose`). Входящие порты по-прежнему не нужны.
 
 ## Команды (в группе)

@@ -20,7 +20,11 @@ from tg_digest_bot.filtered_day import (
     build_filtered_text_for_llm,
     build_user_message_groups,
 )
-from tg_digest_bot.llm.zai import ZaiDigestLLM, format_openai_api_error
+from tg_digest_bot.llm.zai import (
+    ZaiDigestLLM,
+    format_openai_api_error,
+    scrub_cjk_family_scripts,
+)
 from tg_digest_bot.mini_stats import build_mini_stats_text
 from tg_digest_bot.poe2scout_client import (
     build_leagues_catalog_text,
@@ -269,7 +273,7 @@ async def _run_digest_for_day(
     )
     if cached is not None and not force:
         logger.info("Digest cache hit chat=%s day=%s max_mid=%s", chat_id, local_date_str, max_mid)
-        body = f"(из кэша)\n\n{cached}"
+        body = f"(из кэша)\n\n{scrub_cjk_family_scripts(cached)}"
         if truncated:
             body = f"[Обрезано: в дайджест вошли последние {limit} из {total} сообщений]\n\n{body}"
         await status_msg.delete()

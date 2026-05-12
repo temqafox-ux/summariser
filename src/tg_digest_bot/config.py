@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     )
     digest_model: str = Field(default="glm-5.1", validation_alias="DIGEST_MODEL")
     digest_tz: str = Field(default="Europe/Moscow", validation_alias="DIGEST_TZ")
-    prompt_version: str = Field(default="3", validation_alias="PROMPT_VERSION")
+    prompt_version: str = Field(default="4", validation_alias="PROMPT_VERSION")
     database_path: str = Field(
         default="data/bot.sqlite3",
         validation_alias="DATABASE_PATH",
